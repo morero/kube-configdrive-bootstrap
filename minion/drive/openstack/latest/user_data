@@ -1,0 +1,136 @@
+#cloud-config
+hostname: node01
+# include one or more SSH public keys
+ssh_authorized_keys:
+  - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDggE7Opdek02sB4i8x0qNDloZa64KLa0emLxtxf4mm9hoA7xIxZH5hLgqEqUeTsTMFaFQU5qyf/sE19FKLz/QtAuJn5R7VxXj+x2tm5InNkRcpzYl4sL0dWR14Ax2Q+fpSN9voXLVCVLqn0/OwFQcyml38Iq6oL7+kxWRw0IQqQr+d6ZB9yuE8Jg4ry5RM/SKpA4u/nKZ3Jc6oBGPr5hamK4J5qdKAXUh/c+HDeSg9bHYo3zmHsUPfY/MzzWOF2RygTFVIlsZ0Sv3I3+tsBwbS3+z4ytgeVgec2qoxzj+x/2XSgI3senCYa4Aqy+rASfrmD/nh0Y3VEaj/WIxUkWueCNw9ODBIZgaCQeD3D5EPFk8zGKjxEIxl6DUMvR3MbMuY02ta7IkvNZbgad7kYSu9Scf2ISFrh2SH5hjZTlWm3sbm/BgP5qZCvUtxT3iQyMm2vwh1LfUNf9G0kDE3KhYx2ALSCq8ZMzWVNPGgLyGf1+ltj27eIg9VrUdglxOrMPkMkzpK9dABmUoKiIzXlaJpBtRXdFzp34mSpPi3R81wO3FxBFL8N7NblHtydPZyxiNXsGPR754NOS8Ecj7MNlcHjaEOlWTTzP/OMTeWBlNhz1jQJVgX4/Pvt9reMTQlZPGUNV6dxHYA+Y/nC6yUPlXj3+QOL22V65dOwKTTq3dpGw== phx@rancher
+
+write_files:
+  - path: /etc/ssh/sshd_config
+    permissions: 0600
+    owner: root:root
+    content: |
+      # Use most defaults for sshd configuration.
+      UsePrivilegeSeparation sandbox
+      Subsystem sftp internal-sftp
+
+      PermitRootLogin no
+      AllowUsers core
+      PasswordAuthentication no
+      ChallengeResponseAuthentication no
+
+write-files:
+  - path: /opt/bin/wupiao
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      # [w]ait [u]ntil [p]ort [i]s [a]ctually [o]pen
+      [ -n "$1" ] && [ -n "$2" ] && while ! curl --output /dev/null \
+        --silent --head --fail \
+        http://${1}:${2}; do sleep 1 && echo -n .; done;
+      exit $?
+
+coreos:
+  etcd2:
+    name: node01
+    listen-client-urls: http://0.0.0.0:2379
+    advertise-client-urls: http://0.0.0.0:2379
+    initial-cluster: master=http://37.221.193.119:2380
+    proxy: on
+  fleet:
+    metadata: "region=de,role=node"
+    public-ip: 37.221.193.119
+  units:
+    - name: sshd.socket
+      command: restart
+      runtime: true
+      content: |
+        [Socket]
+        ListenStream=33099
+        FreeBind=true
+        Accept=yes
+    - name: etcd2.service
+      command: start
+    - name: fleet.service
+      command: start
+    - name: flanneld.service
+      command: start
+    - name: docker.service
+      command: start
+    - name: setup-network-environment.service
+      command: start
+      content: |
+        [Unit]
+        Description=Setup Network Environment
+        Documentation=https://github.com/kelseyhightower/setup-network-environment
+        Requires=network-online.target
+        After=network-online.target
+
+        [Service]
+        ExecStartPre=-/usr/bin/mkdir -p /opt/bin
+        ExecStartPre=/usr/bin/curl -L -o /opt/bin/setup-network-environment -z /opt/bin/setup-network-environment https://github.com/kelseyhightower/setup-network-environment/releases/download/v1.0.0/setup-network-environment
+        ExecStartPre=/usr/bin/chmod +x /opt/bin/setup-network-environment
+        ExecStart=/opt/bin/setup-network-environment
+        RemainAfterExit=yes
+        Type=oneshot
+    - name: kube-proxy.service
+      command: start
+      content: |
+        [Unit]
+        Description=Kubernetes Proxy
+        Documentation=https://github.com/kubernetes/kubernetes
+        Requires=setup-network-environment.service
+        After=setup-network-environment.service
+
+        [Service]
+        ExecStartPre=/usr/bin/curl -L -o /opt/bin/kube-proxy -z /opt/bin/kube-proxy https://storage.googleapis.com/kubernetes-release/release/v1.4.6/bin/linux/amd64/kube-proxy
+        ExecStartPre=/usr/bin/chmod +x /opt/bin/kube-proxy
+        # wait for kubernetes master to be up and ready
+        ExecStartPre=/opt/bin/wupiao 37.221.193.119 8080
+        ExecStart=/opt/bin/kube-proxy \
+        --master=37.221.193.119:8080 \
+        --logtostderr=true
+        Restart=always
+        RestartSec=10
+    - name: kube-kubelet.service
+      command: start
+      content: |
+        [Unit]
+        Description=Kubernetes Kubelet
+        Documentation=https://github.com/kubernetes/kubernetes
+        Requires=setup-network-environment.service
+        After=setup-network-environment.service
+
+        [Service]
+        EnvironmentFile=/etc/network-environment
+        ExecStartPre=/usr/bin/curl -L -o /opt/bin/kubelet -z /opt/bin/kubelet https://storage.googleapis.com/kubernetes-release/release/v1.4.6/bin/linux/amd64/kubelet
+        ExecStartPre=/usr/bin/chmod +x /opt/bin/kubelet
+        # wait for kubernetes master to be up and ready
+        ExecStartPre=/opt/bin/wupiao 37.221.193.119 8080
+        ExecStart=/opt/bin/kubelet \
+        --address=0.0.0.0 \
+        --port=10250 \
+        --hostname-override=${DEFAULT_IPV4} \
+        --api-servers=37.221.193.119:8080 \
+        --allow-privileged=true \
+        --logtostderr=true \
+        --cadvisor-port=4194 \
+        --healthz-bind-address=0.0.0.0 \
+        --healthz-port=10248
+        Restart=always
+        RestartSec=10
+    - name: kubectl-download.service
+      command: start
+      content: |
+        [Unit]
+        Description=Download Kubernetes kubectl
+        Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+        ConditionPathExists=!/opt/bin/kubectl
+        [Service]
+        Type=oneshot
+        ExecStart=/usr/bin/wget -NP /opt/bin http://storage.googleapis.com/kubernetes-release/release/v1.4.6/bin/linux/amd64/kubectl
+        ExecStartPost=/usr/bin/chmod +x /opt/bin/kubectl
+  update:
+    group: alpha
+    reboot-strategy: off
+
+
